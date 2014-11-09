@@ -1,5 +1,5 @@
 {
-   "abstract" : "It's new $module",
+   "abstract" : "Queue interface for Gearman.",
    "author" : [
       "karupanerura <karupa@cpan.org>"
    ],
@@ -52,6 +52,17 @@
       }
    },
    "release_status" : "unstable",
+   "resources" : {
+      "bugtracker" : {
+         "web" : "https://github.com/karupanerura/Queue-Gearman/issues"
+      },
+      "homepage" : "https://github.com/karupanerura/Queue-Gearman",
+      "repository" : {
+         "type" : "git",
+         "url" : "git://github.com/karupanerura/Queue-Gearman.git",
+         "web" : "https://github.com/karupanerura/Queue-Gearman"
+      }
+   },
    "version" : "0.01",
    "x_authority" : "cpan:KARUPA"
 }
