@@ -47,13 +47,18 @@
             "List::Util" : "0",
             "Scalar::Util" : "0",
             "Socket" : "0",
+            "Time::HiRes" : "0",
             "parent" : "0",
             "perl" : "5.008001"
          }
       },
       "test" : {
          "requires" : {
-            "Test::More" : "0.98"
+            "File::Which" : "0",
+            "Test::Builder::Module" : "0",
+            "Test::More" : "0.98",
+            "Test::SharedFork" : "0",
+            "Test::TCP" : "0"
          }
       }
    },
