@@ -155,7 +155,7 @@ __END__
 
 =head1 NAME
 
-Queue::Gearman::Message - Gearman protocol messsage builder and parser.
+Queue::Gearman::Message - Gearman protocol message builder and parser.
 
 =head1 SYNOPSIS
 
