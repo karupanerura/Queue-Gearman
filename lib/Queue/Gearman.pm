@@ -5,7 +5,229 @@ use warnings;
 
 our $VERSION = "0.01";
 
+use Queue::Gearman::Pool;
+use Queue::Gearman::Message qw/:headers :msgtypes/;
+use Queue::Gearman::Task;
+use Queue::Gearman::Taskset;
+use Queue::Gearman::Job;
+use Queue::Gearman::Util qw/dumper/;
+use List::Util qw/shuffle/;
+use Digest::MD5 qw/md5_hex/;
+use Time::HiRes;
 
+use constant DEFAULT_TIMEOUT            => 1;
+use constant DEFAULT_DEQUEUE_TIMEOUT    => 1;
+use constant DEFAULT_WAIT_TIMEOUT       => 1;
+use constant DEFAULT_INACTIVITY_TIMEOUT => 10;
+
+use Class::Accessor::Lite ro => [qw/
+    servers
+    prefix
+    timeout
+    dequeue_timeout
+    wait_timeout
+    inactivity_timeout
+    serialize_method
+    deserialize_method
+/];
+
+my %ENQUEUE_HEADER = (
+    background => +{
+        priority => +{
+            high   => HEADER_REQ_SUBMIT_JOB_HIGH_BG,
+            normal => HEADER_REQ_SUBMIT_JOB_BG,
+            low    => HEADER_REQ_SUBMIT_JOB_LOW_BG,
+        },
+    },
+    foreground => +{
+        priority => +{
+            high   => HEADER_REQ_SUBMIT_JOB_HIGH,
+            normal => HEADER_REQ_SUBMIT_JOB,
+            low    => HEADER_REQ_SUBMIT_JOB_LOW,
+        },
+    },
+);
+
+sub _identity { $_[0] }
+
+sub new {
+    my $class = shift;
+    my $self  = bless +{
+        timeout            => DEFAULT_TIMEOUT,
+        dequeue_timeout    => DEFAULT_DEQUEUE_TIMEOUT,
+        wait_timeout       => DEFAULT_WAIT_TIMEOUT,
+        inactivity_timeout => DEFAULT_INACTIVITY_TIMEOUT,
+        serialize_method   => \&_identity,
+        deserialize_method => \&_identity,
+        @_
+    } => $class;
+    return $self;
+}
+
+sub taskset {
+    my $self = shift;
+    return $self->{taskset} ||= Queue::Gearman::Taskset->new(
+        wait_timeout       => $self->wait_timeout,
+        serialize_method   => $self->serialize_method,
+        deserialize_method => $self->deserialize_method,
+    );
+}
+
+sub client_id {
+    my $self = shift;
+    return $self->{client_id} ||= md5_hex(rand() . $$ . {} . time);
+}
+
+sub _pool {
+    my ($self, $role) = @_;
+    return $self->{pool}->{$role} if exists $self->{pool}->{$role};
+    $self->{pool}->{$role} = Queue::Gearman::Pool->new(
+        servers            => $self->servers,
+        timeout            => $self->timeout,
+        inactivity_timeout => $self->inactivity_timeout,
+    );
+    $self->_set_client_id if $role eq 'worker';
+    return $self->{pool}->{$role};
+}
+
+sub _encode_func {
+    my ($self, $func) = @_;
+    my $prefix = $self->prefix or return $func;
+    return "$prefix\t$func";
+}
+
+sub _decode_func {
+    my ($self, $func) = @_;
+    my $prefix = $self->prefix or return $func;
+    $func =~ s/^\Q$prefix\t//;
+    return $func;
+}
+
+sub _serialize {
+    my ($self, $arg) = @_;
+    return scalar $self->serialize_method->($arg);
+}
+
+sub _deserialize {
+    my ($self, $arg) = @_;
+    return scalar $self->deserialize_method->($arg);
+}
+
+sub _set_client_id {
+    my $self = shift;
+    for my $socket ($self->_pool('worker')->all) {
+        $socket->send(HEADER_REQ_SET_CLIENT_ID, $self->client_id);
+    }
+}
+
+sub can_do {
+    my $self = shift;
+    my $func = $self->_encode_func(shift);
+    my $header = @_ ? HEADER_REQ_CAN_DO_TIMEOUT : HEADER_REQ_CAN_DO;
+    for my $socket ($self->_pool('worker')->all) {
+        $socket->send($header, $func, @_);
+    }
+}
+
+sub cant_do {
+    my $self = shift;
+    my $func = $self->_encode_func(shift);
+    for my $socket ($self->_pool('worker')->all) {
+        $socket->send(HEADER_REQ_CANT_DO, $func);
+    }
+}
+
+sub reset_abilities {
+    my $self = shift;
+    for my $socket ($self->_pool('worker')->all) {
+        $socket->send(HEADER_REQ_RESET_ABILITIES);
+    }
+}
+
+sub enqueue { shift->enqueue_background(@_) }
+
+sub enqueue_background {
+    my $self = shift;
+    my $opt  = exists $_[3] ? $_[3] : +{};
+
+    my $unique   = $opt->{unique}   || '';
+    my $priority = $opt->{priority} || 'normal';
+    my $header   = exists $ENQUEUE_HEADER{background}{$priority} ? $ENQUEUE_HEADER{background}{$priority}
+                                                                 : HEADER_REQ_SUBMIT_JOB_BG;
+    return $self->_enqueue($header, 1, $unique, @_);
+}
+
+sub enqueue_forground {
+    my $self = shift;
+    my $opt  = exists $_[3] ? $_[3] : +{};
+
+    my $unique   = $opt->{unique}   || '';
+    my $priority = $opt->{priority} || 'normal';
+    my $header   = exists $ENQUEUE_HEADER{foreground}{$priority} ? $ENQUEUE_HEADER{foreground}{$priority}
+                                                                 : HEADER_REQ_SUBMIT_JOB;
+    return $self->_enqueue($header, 0, $unique, @_);
+}
+
+sub _enqueue {
+    my ($self, $header, $is_background, $unique, $func, $arg) = @_;
+
+    my $socket = $self->_pool('client')->pick();
+    my $res = $socket->send($header, $self->_encode_func($func), $unique, $self->_serialize($arg))
+           && $socket->recv();
+    return unless defined $res;
+
+    if ($res->{msgtype} eq MSGTYPE_RES_JOB_CREATED) {
+        my ($handle) = @{ $res->{args} };
+        return Queue::Gearman::Task->new(
+            func          => $func,
+            handle        => $handle,
+            arg           => $arg,
+            taskset       => $self->taskset,
+            socket        => $socket,
+            is_background => $is_background,
+        );
+    }
+    else {
+        die "Unexpected res: ", dumper($res);
+    }
+}
+
+sub dequeue {
+    my ($self, $timeout) = @_;
+    $timeout ||= $self->dequeue_timeout();
+
+    my $timeout_at = Time::HiRes::time + $timeout;
+
+    while (Time::HiRes::time < $timeout_at) {
+        for my $socket (shuffle $self->_pool('worker')->all) {
+            my $res = $socket->send(HEADER_REQ_GRAB_JOB) && $socket->recv();
+            next unless defined $res;
+
+            if ($res->{msgtype} eq MSGTYPE_RES_JOB_ASSIGN) {
+                my ($handle, $func, $arg) = @{ $res->{args} };
+                return Queue::Gearman::Job->new(
+                    func               => $self->_decode_func($func),
+                    handle             => $handle,
+                    arg                => $self->_deserialize($arg),
+                    socket             => $socket,
+                    serialize_method   => $self->serialize_method,
+                    deserialize_method => $self->deserialize_method,
+                );
+            }
+            elsif ($res->{msgtype} eq MSGTYPE_RES_NO_JOB) {
+                $socket->send(HEADER_REQ_PRE_SLEEP);
+            }
+            elsif ($res->{msgtype} eq MSGTYPE_RES_NOOP) {
+                # passthru
+            }
+            else {
+                die "Unexpected res: ", dumper($res);
+            }
+        }
+    }
+
+    return;
+}
 
 1;
 __END__
@@ -14,28 +236,43 @@ __END__
 
 =head1 NAME
 
-Queue::Gearman - Queue interface for Gearman.
+Queue::Gearman - Queue like low-level interface for Gearman.
 
 =head1 SYNOPSIS
 
     use Queue::Gearman;
+    use JSON;
 
-    my $queue = Queue::Gearman->new(servers => ['127.0.0.1:6667']);
-    $queue->can_do('Foo');
+    sub add {
+        my $args = shift;
+        return $args->{left} + $args->{rigth};
+    }
 
-    $queue->enqueue(Foo => '{"args":{"foo":"bar"}}');
+    my $queue = Queue::Gearman->new(
+        servers            => ['127.0.0.1:6667'],
+        serialize_method   => \&JSON::encode_json,
+        deserialize_method => \&JSON::decode_json,
+    );
+    $queue->can_do('add');
 
-    my $job = $queue->dequeue(timeout => 1);
-    if ($job->func eq 'Foo') {
-        my $args = decode_json $job->arg;
-        my $res  = eval { Foo->work($args) };
+    my $task = $queue->enqueue_forground(add => { left => 1, rigth => 2 })
+        or die 'failure';
+    $queue->enqueue_background(add => { left => 2, rigth => 1 })
+        or die 'failure';
+
+    my $job = $queue->dequeue();
+    if ($job && $job->func eq 'add') {
+        my $res = eval { add($job->arg) };
         if (my $e = $@) {
-            $job->fail(encode_json $e);
+            $job->fail($e);
         }
         else {
-            $job->complete(encode_json $res);
+            $job->complete($res);
         }
     }
+
+    $task->wait();
+    print $task->result, "\n"; ## => 3
 
 =head1 DESCRIPTION
 
