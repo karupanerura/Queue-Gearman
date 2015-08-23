@@ -10,6 +10,7 @@ use Class::Accessor::Lite new => 1, ro => [qw/
     servers
     timeout
     inactivity_timeout
+    on_connect_do
 /];
 
 sub get {
@@ -18,6 +19,7 @@ sub get {
         server             => $server,
         timeout            => $self->timeout,
         inactivity_timeout => $self->inactivity_timeout,
+        on_connect_do      => $self->on_connect_do,
     );
 }
 

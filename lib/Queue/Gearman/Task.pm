@@ -14,11 +14,15 @@ use Class::Accessor::Lite ro => [qw/
     socket
     taskset
     is_background
+    owner_pid
 /], rw => [qw/data warning fail status exception result done/];
 
 sub new {
     my ($class, %args) = @_;
-    my $self = bless \%args => $class;
+    my $self = bless {
+        %args,
+        owner_pid => $$,
+    } => $class;
     $self->taskset->add($self);
     return $self;
 }
@@ -49,12 +53,14 @@ sub wait :method {
         return $self;
     }
 
-    $self->taskset->wait(@_) until $self->is_finished;
+    $self->taskset->wait(@_);
     return $self;
 }
 
 sub DESTROY {
     my $self = shift;
+    return if $self->{owner_pid} != $$;
+
     $self->remove();
 }
 

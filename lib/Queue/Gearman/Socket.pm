@@ -19,6 +19,7 @@ use Class::Accessor::Lite new => 1, ro => [qw/
     server
     timeout
     inactivity_timeout
+    on_connect_do
 /];
 
 sub _connect {
@@ -36,6 +37,8 @@ sub _connect {
     $self->{owner_pid} = $$;
     $self->{sock}      = $sock;
     $self->{select}    = IO::Select->new($sock);
+
+    $self->{on_connect_do}->($self) if defined $self->{on_connect_do};
 
     return $sock;
 }

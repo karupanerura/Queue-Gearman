@@ -11,6 +11,7 @@ use Queue::Gearman::Task;
 use Queue::Gearman::Taskset;
 use Queue::Gearman::Job;
 use Queue::Gearman::Util qw/dumper/;
+use Scalar::Util qw/weaken/;
 use List::Util qw/shuffle/;
 use Digest::MD5 qw/md5_hex/;
 use Time::HiRes;
@@ -48,6 +49,7 @@ my %ENQUEUE_HEADER = (
     },
 );
 
+sub _noop     {}
 sub _identity { $_[0] }
 
 sub new {
@@ -59,6 +61,7 @@ sub new {
         inactivity_timeout => DEFAULT_INACTIVITY_TIMEOUT,
         serialize_method   => \&_identity,
         deserialize_method => \&_identity,
+        ability_map        => {},
         @_
     } => $class;
     return $self;
@@ -85,9 +88,27 @@ sub _pool {
         servers            => $self->servers,
         timeout            => $self->timeout,
         inactivity_timeout => $self->inactivity_timeout,
+        on_connect_do      => $self->_on_connect_do($role),
     );
-    $self->_set_client_id if $role eq 'worker';
     return $self->{pool}->{$role};
+}
+
+sub _on_connect_do {
+    my ($self, $role) = @_;
+    if ($role eq 'worker') {
+        weaken($self);
+        return sub {
+            my $socket = shift;
+            $socket->send(HEADER_REQ_PRE_SLEEP);
+            $socket->send(HEADER_REQ_SET_CLIENT_ID, $self->client_id);
+
+            for my $args (values %{ $self->{ability_map} }) {
+                my @msg = $self->_make_can_do_msg(@$args);
+                $socket->send(@msg);
+            }
+        };
+    }
+    return \&_noop;
 }
 
 sub _encode_func {
@@ -113,28 +134,35 @@ sub _deserialize {
     return scalar $self->deserialize_method->($arg);
 }
 
-sub _set_client_id {
-    my $self = shift;
-    for my $socket ($self->_pool('worker')->all) {
-        $socket->send(HEADER_REQ_SET_CLIENT_ID, $self->client_id);
-    }
-}
-
 sub can_do {
     my $self = shift;
-    my $func = $self->_encode_func(shift);
-    my $header = @_ ? HEADER_REQ_CAN_DO_TIMEOUT : HEADER_REQ_CAN_DO;
-    for my $socket ($self->_pool('worker')->all) {
-        $socket->send($header, $func, @_);
-    }
+    my ($func) = @_;
+
+    my @msg = $self->_make_can_do_msg(@_);
+    $_->send(@msg) for $self->_pool('worker')->all;
+
+    $self->{ability_map}->{$func} = [@_];
 }
 
 sub cant_do {
+    my ($self, $func) = @_;
+
+    delete $self->{ability_map}->{$func};
+
+    my @msg = $self->_make_cant_do_msg($func);
+    $_->send(@msg) for $self->_pool('worker')->all;
+}
+
+sub _make_can_do_msg {
     my $self = shift;
-    my $func = $self->_encode_func(shift);
-    for my $socket ($self->_pool('worker')->all) {
-        $socket->send(HEADER_REQ_CANT_DO, $func);
-    }
+    my $func = shift;
+    return @_ == 1 ? (HEADER_REQ_CAN_DO_TIMEOUT,  $self->_encode_func($func), @_)
+                   : (HEADER_REQ_CAN_DO,          $self->_encode_func($func));
+}
+
+sub _make_cant_do_msg {
+    my ($self, $func) = @_;
+    return (HEADER_REQ_CANT_DO, $self->_encode_func($func));
 }
 
 sub reset_abilities {
@@ -142,6 +170,7 @@ sub reset_abilities {
     for my $socket ($self->_pool('worker')->all) {
         $socket->send(HEADER_REQ_RESET_ABILITIES);
     }
+    %{$self->{ability_map}} = ();
 }
 
 sub enqueue { shift->enqueue_background(@_) }
@@ -187,9 +216,8 @@ sub _enqueue {
             is_background => $is_background,
         );
     }
-    else {
-        die "Unexpected res: ", dumper($res);
-    }
+
+    die "Unexpected res: ", dumper($res);
 }
 
 sub dequeue {
@@ -200,7 +228,10 @@ sub dequeue {
 
     while (Time::HiRes::time < $timeout_at) {
         for my $socket (shuffle $self->_pool('worker')->all) {
-            my $res = $socket->send(HEADER_REQ_GRAB_JOB) && $socket->recv();
+            $socket->send(HEADER_REQ_GRAB_JOB);
+
+        TRY_RECV:
+            my $res = $socket->recv();
             next unless defined $res;
 
             if ($res->{msgtype} eq MSGTYPE_RES_JOB_ASSIGN) {
@@ -216,13 +247,13 @@ sub dequeue {
             }
             elsif ($res->{msgtype} eq MSGTYPE_RES_NO_JOB) {
                 $socket->send(HEADER_REQ_PRE_SLEEP);
+                next;
             }
             elsif ($res->{msgtype} eq MSGTYPE_RES_NOOP) {
-                # passthru
+                goto TRY_RECV; ## retry to recv
             }
-            else {
-                die "Unexpected res: ", dumper($res);
-            }
+
+            die "Unexpected res: ", dumper($res);
         }
     }
 

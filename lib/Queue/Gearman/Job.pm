@@ -6,12 +6,24 @@ use utf8;
 use Carp qw/carp/;
 use Queue::Gearman::Message qw/:headers/;
 
-use Class::Accessor::Lite new => 1, ro => [qw/
+use Class::Accessor::Lite ro => [qw/
     func
     arg
     handle
     socket
+    owner_pid
 /], rw => [qw/serialize_method deserialize_method done/];
+
+sub new {
+    my ($class, %args) = @_;
+    my $self = bless {
+        %args,
+        owner_pid => $$,
+    } => $class;
+    return $self;
+}
+
+sub is_finished { shift->done }
 
 sub _serialize {
     my ($self, $arg) = @_;
@@ -59,8 +71,9 @@ sub fail {
 
 sub DESTROY {
     my $self = shift;
+    return if $self->{owner_pid} != $$;
     return if $self->done;
-    carp "EXPECT call complete/fail method, but not called.";
+    carp "EXPECT call complete/fail/abort method, but not called.";
 }
 
 1;
