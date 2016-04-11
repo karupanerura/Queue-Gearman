@@ -50,14 +50,14 @@ sub remove {
 
 sub can_read {
     my $self = shift;
-    my @ready = $self->select()->can_read(@_);
-    return @{$self->{socket}}{map { $_->fileno } @ready};
+    my @readable = $self->select()->can_read(@_);
+    return @{$self->{socket}}{map { $_->fileno } @readable};
 }
 
 sub can_write {
     my $self = shift;
-    my @ready = $self->select()->can_read(@_);
-    return @{$self->{socket}}{map { $_->fileno } @ready};
+    my @writable = $self->select()->can_write(@_);
+    return @{$self->{socket}}{map { $_->fileno } @writable};
 }
 
 1;
